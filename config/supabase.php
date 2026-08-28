@@ -11,36 +11,42 @@
  */
 
 // ---- Project credentials --------------------------------------------------
-// These match the project already wired up in js/supabase-client.js.
-// The anon key is safe to expose (it's public by design; access is governed
-// by Row Level Security policies on each table) — env vars override these
-// if set, so production deploys should still set real env vars.
 define('SUPABASE_URL', getenv('SUPABASE_URL') ?: 'https://fgwaeugfkrljgbbgvaox.supabase.co');
 define('SUPABASE_ANON_KEY', getenv('SUPABASE_ANON_KEY') ?: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZnd2FldWdma3JsamdiYmd2YW94Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY3MTExNjIsImV4cCI6MjEwMjI4NzE2Mn0.HvSYkJy2m0rXo5J-Dlx34tTplUT3qRDoZIM67gyY1dc');
 
 // Service role key should ONLY ever be used server-side (never sent to the browser).
 define('SUPABASE_SERVICE_KEY', getenv('SUPABASE_SERVICE_KEY') ?: 'YOUR-SUPABASE-SERVICE-ROLE-KEY');
 
-// ---- Real table shape -----------------------------------------------------
-// events(id uuid pk, title text, poster_url text, start_date date, venue text,
-//        status text, category_id uuid fk -> categories.id, organization_id uuid, created_at timestamptz)
-// categories(id uuid pk, name text)
-// organizations(id uuid pk, name text, logo_url text)
-// registrations(id uuid pk, event_id uuid fk, user_id uuid fk, status text)
-// announcements(id uuid pk, title text, body text, type text, created_at timestamptz)
-// profiles(id uuid pk references auth.users(id), full_name text, role text, avatar_url text)
+// ---- Real table shape (confirmed directly against the live Supabase project) ----
+// profiles(id uuid pk -> auth.users.id, full_name text, role user_role['admin'|'user'],
+//          avatar_url text, phone text, created_at, updated_at)
+// organizations(id uuid pk, name text unique, description text, logo_url text,
+//               created_by uuid -> profiles.id, created_at, updated_at)
+// categories(id uuid pk, name text unique, description text,
+//            created_by uuid -> profiles.id, created_at, updated_at)
+// events(id uuid pk, title text, category_id -> categories.id, organization_id -> organizations.id,
+//        event_type event_type['academic'|'seminar'|'workshop'|'sports'|'cultural'|'other'],
+//        description text, start_date date, start_time time, end_date date, end_time time,
+//        venue text, is_online bool, online_event_link text, address text, poster_url text,
+//        registration_limit int, registration_deadline date, contact_email text, contact_number text,
+//        enable_registration bool, is_published bool, send_notification bool,
+//        status event_status['draft'|'published'|'cancelled'|'completed'],
+//        created_by -> profiles.id, created_at, updated_at)
+// event_registrations(id uuid pk, event_id -> events.id, user_id -> profiles.id,
+//                      status registration_status['registered'|'waitlisted'|'cancelled'|'attended'],
+//                      registered_at)
+// notifications(id uuid pk, event_id -> events.id (nullable), user_id -> profiles.id (nullable),
+//               title text, message text, status notification_status['pending'|'sent'|'failed'],
+//               created_at, sent_at)
+// stats(id uuid pk, label text, value text, sort_order int, created_at, updated_at)
 //
-// NOTE: the ER diagram this project was designed from actually names two of
-// these tables differently — `event_registrations` (not `registrations`) and
-// `notifications` (not `announcements`), and event_registrations has a
-// `registered_at` column rather than relying on a generic timestamp. The
-// helpers added below (register_for_event, is_registered,
-// get_registration_count) use `event_registrations` to match that diagram.
-// dashboard.php's existing "Announcements" panel is left as-is on
-// `announcements`, since it may be an intentionally separate,
-// school-wide-broadcast table rather than the per-user `notifications` one —
-// worth confirming which table actually exists in your Supabase project and
-// aligning whichever side is stale.
+// IMPORTANT: role / status / event_type / registration_status / notification_status
+// are real Postgres ENUM columns. Any INSERT/UPDATE using a value outside the
+// listed set fails at the database level (PostgREST returns an error, and
+// supabase_request() will hand back [] for that write). There is no
+// `registrations` or `announcements` table — those were only ever a stale
+// comment/leftover reference; the real tables are `event_registrations`
+// and `notifications`.
 //
 // Required Supabase Auth setup (do this once in the dashboard):
 // 1. Auth -> Providers -> Email: enable "Email" provider (password sign-in).
@@ -97,11 +103,13 @@ function supabase_http(string $method, string $url, array $headers, ?array $body
  */
 function supabase_request(string $table, string $query = '', string $method = 'GET', ?array $body = null, bool $useServiceKey = false, ?string $userToken = null): array
 {
-    // Default to embedding the categories relationship whenever events
-    // is queried without an explicit select, so $ev['categories']['name']
-    // works the way the templates expect.
+    // Default to embedding the categories relationship whenever events is
+    // queried without an explicit select, and restrict to published events
+    // so draft/cancelled events don't leak onto public-facing pages. Pages
+    // that need every status (e.g. a future admin dashboard) should pass
+    // their own $query explicitly instead of relying on this default.
     if ($table === 'events' && $query === '' && $method === 'GET') {
-        $query = 'select=*,categories(name)&order=start_date.asc';
+        $query = 'select=*,categories(name),organizations(name,logo_url)&status=eq.published&order=start_date.asc';
     }
 
     $authKey = $useServiceKey ? SUPABASE_SERVICE_KEY : SUPABASE_ANON_KEY;
@@ -117,10 +125,9 @@ function supabase_request(string $table, string $query = '', string $method = 'G
     ], $body);
 
     // Any failure — network-level (status 0) OR an API-level error response
-    // (missing table, bad query, RLS block, etc.) — must NEVER hand the raw
-    // error object back to callers expecting an array of rows. That's what
-    // caused foreach ($stats as $s) { $s['value'] } to fatal-error: $s ended
-    // up being a plain string from the error object instead of a row.
+    // (missing table, bad query, RLS block, invalid enum value, etc.) — must
+    // NEVER hand the raw error object back to callers expecting an array of
+    // rows.
     if (!$result['ok']) {
         error_log(sprintf(
             '[supabase_request] %s %s failed (HTTP %d): %s',
@@ -141,8 +148,6 @@ function supabase_request(string $table, string $query = '', string $method = 'G
     }
 
     // Defensive guard: even a 2xx response should be an array of rows.
-    // If PostgREST ever returns something unexpected, don't let a
-    // non-array leak into a foreach() in a template.
     if (!is_array($result['data'])) {
         error_log("[supabase_request] $method $table returned non-array data, coercing to []");
         return [];
@@ -163,10 +168,10 @@ function supabase_mock_data(string $table): array
             ['id' => 3, 'title' => 'GEN Z Night 2026', 'categories' => ['name' => 'Event'], 'poster_url' => 'assets/event-genz.jpg', 'start_date' => 'TBA', 'venue' => 'AVR 1, CITE Building'],
             ['id' => 4, 'title' => 'JPSSITE Talk: Misinformation', 'categories' => ['name' => 'Seminar'], 'poster_url' => 'assets/event-talk.jpg', 'start_date' => 'TBA', 'venue' => 'AVR 1, CITE Building'],
         ],
-        'announcements' => [
-            ['id' => 1, 'title' => 'New scholarship opportunity available!', 'type' => 'info', 'created_at' => 'TBA'],
-            ['id' => 2, 'title' => 'Class suspended on Month 00 0000 (Day)', 'type' => 'alert', 'created_at' => 'TBA'],
-            ['id' => 3, 'title' => 'Submission of your requirements!', 'type' => 'reminder', 'created_at' => 'TBA'],
+        'notifications' => [
+            ['id' => 1, 'title' => 'New scholarship opportunity available!', 'message' => '', 'created_at' => 'TBA'],
+            ['id' => 2, 'title' => 'Class suspended on Month 00 0000 (Day)', 'message' => '', 'created_at' => 'TBA'],
+            ['id' => 3, 'title' => 'Submission of your requirements!', 'message' => '', 'created_at' => 'TBA'],
         ],
         'stats' => [
             ['label' => 'Events', 'value' => '000+'],
@@ -174,10 +179,9 @@ function supabase_mock_data(string $table): array
             ['label' => 'Active Users', 'value' => '0.0k+'],
             ['label' => 'Registrations', 'value' => '00k+'],
         ],
-        // No rows by default — event-details.php still renders fine (just
-        // shows 0 registered / an empty state) when Supabase is unreachable.
+        // No rows by default — pages still render fine (just show an empty
+        // state) when Supabase is unreachable.
         'event_registrations' => [],
-        'notifications' => [],
     ];
 
     return $mocks[$table] ?? [];
@@ -281,13 +285,17 @@ function supabase_auth_signout(): void
     session_destroy();
 }
 
-/** Insert the profiles row for a freshly-created user. */
+/**
+ * Insert the profiles row for a freshly-created user.
+ * NOTE: `role` is a real Postgres enum (`admin` | `user`) — it must be one
+ * of those two literal values, never a display label like "Student".
+ */
 function create_profile(string $userId, string $fullName, string $accessToken): void
 {
     supabase_request('profiles', '', 'POST', [
         'id' => $userId,
         'full_name' => $fullName,
-        'role' => 'Student',
+        'role' => 'user',
     ], false, $accessToken);
 }
 
@@ -300,8 +308,17 @@ function ensure_profile_exists(string $userId, string $fullName, string $accessT
     }
 }
 
+/**
+ * Turn the stored enum role ('admin' | 'user') into the label the UI shows.
+ * Keep the DB value a valid enum; keep the display word human-friendly.
+ */
+function role_display(string $role): string
+{
+    return $role === 'admin' ? 'Admin' : 'Student';
+}
+
 // =============================================================================
-// EVENT REGISTRATION  (event_registrations table — see schema note at top)
+// EVENT REGISTRATION  (event_registrations table)
 // =============================================================================
 // These run the insert/select AS the logged-in user (their own access token,
 // same pattern as create_profile()/ensure_profile_exists() above) so RLS can
@@ -318,6 +335,10 @@ function ensure_profile_exists(string $userId, string $fullName, string $accessT
 
 /**
  * Register the current session's user for an event.
+ * NOTE: `status` is a real Postgres enum ('registered' | 'waitlisted' |
+ * 'cancelled' | 'attended') — 'pending' is NOT a valid value and will make
+ * this insert fail every time.
+ *
  * @return array{ok:bool, message:string}
  */
 function register_for_event(string $eventId): array
@@ -340,7 +361,7 @@ function register_for_event(string $eventId): array
     $result = supabase_request('event_registrations', '', 'POST', [
         'event_id' => $eventId,
         'user_id' => $user['id'],
-        'status' => 'pending',
+        'status' => 'registered',
         'registered_at' => date('c'),
     ], false, $token);
 
@@ -382,9 +403,9 @@ function start_user_session(array $authUser, string $fullName, ?string $refreshT
     session_start_once();
     session_regenerate_id(true);
 
-    // Pull the role from profiles so it reflects reality (defaults to Student).
+    // Pull the role from profiles so it reflects reality (defaults to 'user').
     $profile = supabase_request('profiles', 'select=full_name,role&id=eq.' . urlencode($authUser['id']), 'GET', null, false, $accessToken);
-    $role = $profile[0]['role'] ?? 'Student';
+    $role = $profile[0]['role'] ?? 'user';
     $profileName = $profile[0]['full_name'] ?? $fullName;
 
     $_SESSION['access_token'] = $accessToken;
@@ -393,7 +414,7 @@ function start_user_session(array $authUser, string $fullName, ?string $refreshT
         'id' => $authUser['id'],
         'email' => $authUser['email'],
         'full_name' => $profileName,
-        'role' => $role,
+        'role' => $role, // raw enum value ('admin' | 'user') — use role_display() when showing this in the UI
         'avatar_url' => null,
     ];
 }

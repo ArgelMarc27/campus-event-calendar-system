@@ -3,7 +3,10 @@ require_once __DIR__ . '/config/supabase.php';
 
 $user = require_login(); // redirects to login.php if not authenticated
 $events = supabase_request('events');
-$announcements = supabase_request('announcements');
+// There is no `announcements` table in Supabase — the real table is
+// `notifications` (event_id/user_id nullable, title, message, status,
+// created_at). Pull the most recent ones for this panel.
+$announcements = supabase_request('notifications', 'select=*&order=created_at.desc&limit=6');
 
 // Small helper to pull initials for the avatar bubble
 function initials(string $name): string {
@@ -57,7 +60,7 @@ function initials(string $name): string {
         <div class="avatar"><?= htmlspecialchars(initials($user['full_name'])) ?></div>
         <div>
           <div class="user-name"><?= htmlspecialchars($user['full_name']) ?></div>
-          <div class="user-role"><?= htmlspecialchars($user['role']) ?></div>
+          <div class="user-role"><?= htmlspecialchars(role_display($user['role'])) ?></div>
         </div>
         <a href="logout.php" style="margin-left:8px; font-size:0.78rem; color:var(--text-muted);">Log out</a>
       </div>
@@ -195,10 +198,15 @@ function initials(string $name): string {
 
     <div class="rail-card">
       <h3>Announcements</h3>
-      <?php foreach ($announcements as $a): ?>
+      <?php if (empty($announcements)): ?>
+        <p style="font-size:0.8rem; color:var(--text-muted);">No announcements yet.</p>
+      <?php endif; ?>
+      <?php foreach ($announcements as $a):
+        $type = $a['type'] ?? 'info'; // notifications has no 'type' column; default the icon
+      ?>
         <div class="announcement-item">
-          <span class="ann-icon <?= htmlspecialchars($a['type']) ?>">
-            <?= $a['type'] === 'alert' ? '⚠️' : ($a['type'] === 'reminder' ? '📄' : '📣') ?>
+          <span class="ann-icon <?= htmlspecialchars($type) ?>">
+            <?= $type === 'alert' ? '⚠️' : ($type === 'reminder' ? '📄' : '📣') ?>
           </span>
           <div>
             <div class="ann-title"><?= htmlspecialchars($a['title']) ?></div>

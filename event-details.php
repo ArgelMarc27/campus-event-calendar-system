@@ -122,7 +122,7 @@ $afternoonProgram = ['Registration', 'Tawag ng JPSSITE', 'Game / Activities', 'B
         <div class="avatar"><?= htmlspecialchars(initials($user['full_name'])) ?></div>
         <div>
           <div class="user-name"><?= htmlspecialchars($user['full_name']) ?></div>
-          <div class="user-role"><?= htmlspecialchars($user['role']) ?></div>
+          <div class="user-role"><?= htmlspecialchars(role_display($user['role'])) ?></div>
         </div>
         <a href="logout.php" style="margin-left:8px; font-size:0.78rem; color:var(--text-muted);">Log out</a>
       </div>
