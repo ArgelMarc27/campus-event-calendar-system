@@ -13,12 +13,20 @@ $errors = [];
 $flashCreated = isset($_GET['created']);
 $flashUpdated = isset($_GET['updated']);
 $flashDeleted = isset($_GET['deleted']);
+$flashStatusUpdated = isset($_GET['status_updated']);
 $flashError = isset($_GET['error']);
 
 // ---- Handle delete ----
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'delete') {
     delete_event_admin($_POST['id'] ?? '');
     header('Location: event-organizer.php?deleted=1');
+    exit;
+}
+
+// ---- Handle status-only changes (Cancel / Mark Completed / Reopen / Unpublish) ----
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'set_status') {
+    $result = set_event_status_admin($_POST['id'] ?? '', $_POST['status'] ?? '');
+    header('Location: event-organizer.php?' . ($result['ok'] ? 'status_updated=1' : 'error=1'));
     exit;
 }
 
@@ -126,6 +134,7 @@ $eventTypeChecked = fn(string $type) => (($f['event_type'] ?? '') === $type) ? '
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title><?= $editId ? 'Edit Event' : 'Add New Event' ?> — Campus Event Hub</title>
 <link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/admin.css">
 </head>
 <body>
 
@@ -150,9 +159,12 @@ $eventTypeChecked = fn(string $type) => (($f['event_type'] ?? '') === $type) ? '
       <a href="#event"><span class="icon">🎟️</span> Event <span style="margin-left:auto;">⌄</span></a>
     </nav>
 
-    <div style="margin-top:auto;">
+    <div style="margin-top:auto; display:flex; flex-direction:column; gap:8px;">
       <a href="event-organizer.php" style="display:flex; align-items:center; gap:12px; padding:12px 14px; border-radius:8px; font-weight:600; font-size:0.9rem; color:#fff; background:var(--orange);">
         <span class="icon">🛠️</span> Admin View
+      </a>
+      <a href="admin-taxonomy.php" style="display:flex; align-items:center; gap:12px; padding:12px 14px; border-radius:8px; font-weight:600; font-size:0.9rem; color:#cdd8ef; background:rgba(255,255,255,0.08);">
+        <span class="icon">🏷️</span> Categories &amp; Orgs
       </a>
     </div>
   </aside>
@@ -185,6 +197,7 @@ $eventTypeChecked = fn(string $type) => (($f['event_type'] ?? '') === $type) ? '
     <?php if ($flashCreated): ?><div class="auth-success">Event created.</div><?php endif; ?>
     <?php if ($flashUpdated): ?><div class="auth-success">Event updated.</div><?php endif; ?>
     <?php if ($flashDeleted): ?><div class="auth-success">Event deleted.</div><?php endif; ?>
+    <?php if ($flashStatusUpdated): ?><div class="auth-success">Event status updated.</div><?php endif; ?>
     <?php if ($flashError): ?><div class="auth-alert">Something went wrong. Please try again.</div><?php endif; ?>
     <?php foreach ($errors as $err): ?><div class="auth-alert"><?= htmlspecialchars($err) ?></div><?php endforeach; ?>
 
@@ -207,6 +220,9 @@ $eventTypeChecked = fn(string $type) => (($f['event_type'] ?? '') === $type) ? '
                 <option value="<?= htmlspecialchars($c['id']) ?>" <?= ($f['category_id'] ?? '') === $c['id'] ? 'selected' : '' ?>><?= htmlspecialchars($c['name']) ?></option>
               <?php endforeach; ?>
             </select>
+            <?php if (empty($categories)): ?>
+              <p class="admin-hint">No categories yet — <a href="admin-taxonomy.php">add one</a> before publishing.</p>
+            <?php endif; ?>
           </div>
           <div>
             <label class="admin-label">Organization <span class="req">*</span></label>
@@ -216,6 +232,9 @@ $eventTypeChecked = fn(string $type) => (($f['event_type'] ?? '') === $type) ? '
                 <option value="<?= htmlspecialchars($o['id']) ?>" <?= ($f['organization_id'] ?? '') === $o['id'] ? 'selected' : '' ?>><?= htmlspecialchars($o['name']) ?></option>
               <?php endforeach; ?>
             </select>
+            <?php if (empty($organizations)): ?>
+              <p class="admin-hint">No organizations yet — <a href="admin-taxonomy.php">add one</a> before publishing.</p>
+            <?php endif; ?>
           </div>
         </div>
 
@@ -321,15 +340,45 @@ $eventTypeChecked = fn(string $type) => (($f['event_type'] ?? '') === $type) ? '
           <?php if (empty($events)): ?>
             <tr><td colspan="6" style="color:var(--text-muted); text-align:center; padding:24px;">No events yet — create your first one above.</td></tr>
           <?php endif; ?>
-          <?php foreach ($events as $ev): ?>
+          <?php foreach ($events as $ev):
+            $status = $ev['status'] ?? 'draft';
+          ?>
             <tr>
               <td><?= htmlspecialchars($ev['title']) ?></td>
               <td><?= htmlspecialchars($ev['categories']['name'] ?? '—') ?></td>
               <td><?= htmlspecialchars($ev['organizations']['name'] ?? '—') ?></td>
               <td><?= htmlspecialchars($ev['start_date'] ?? '—') ?></td>
-              <td><span class="admin-status admin-status-<?= htmlspecialchars($ev['status']) ?>"><?= htmlspecialchars(ucfirst($ev['status'])) ?></span></td>
+              <td><span class="admin-status admin-status-<?= htmlspecialchars($status) ?>"><?= htmlspecialchars(ucfirst($status)) ?></span></td>
               <td class="admin-row-actions">
                 <a href="event-organizer.php?edit=<?= urlencode($ev['id']) ?>" class="btn-outline" style="padding:6px 14px; border-radius:6px; font-size:0.78rem;">Edit</a>
+
+                <?php if (in_array($status, ['draft', 'published'], true)): ?>
+                  <form method="POST" action="event-organizer.php" onsubmit="return confirm('Cancel this event? Registered users won\'t be automatically notified.');" style="display:inline;">
+                    <input type="hidden" name="action" value="set_status">
+                    <input type="hidden" name="id" value="<?= htmlspecialchars($ev['id']) ?>">
+                    <input type="hidden" name="status" value="cancelled">
+                    <button type="submit" style="padding:6px 14px; border-radius:6px; font-size:0.78rem; border:1.5px solid var(--red); color:var(--red); background:transparent;">Cancel</button>
+                  </form>
+                <?php endif; ?>
+
+                <?php if ($status === 'published'): ?>
+                  <form method="POST" action="event-organizer.php" style="display:inline;">
+                    <input type="hidden" name="action" value="set_status">
+                    <input type="hidden" name="id" value="<?= htmlspecialchars($ev['id']) ?>">
+                    <input type="hidden" name="status" value="completed">
+                    <button type="submit" style="padding:6px 14px; border-radius:6px; font-size:0.78rem; border:1.5px solid var(--blue-accent); color:var(--blue-accent); background:transparent;">Mark Completed</button>
+                  </form>
+                <?php endif; ?>
+
+                <?php if ($status === 'cancelled'): ?>
+                  <form method="POST" action="event-organizer.php" style="display:inline;">
+                    <input type="hidden" name="action" value="set_status">
+                    <input type="hidden" name="id" value="<?= htmlspecialchars($ev['id']) ?>">
+                    <input type="hidden" name="status" value="draft">
+                    <button type="submit" style="padding:6px 14px; border-radius:6px; font-size:0.78rem; border:1.5px solid var(--text-muted); color:var(--text-muted); background:transparent;">Reopen as Draft</button>
+                  </form>
+                <?php endif; ?>
+
                 <form method="POST" action="event-organizer.php" onsubmit="return confirm('Delete this event? This cannot be undone.');" style="display:inline;">
                   <input type="hidden" name="action" value="delete">
                   <input type="hidden" name="id" value="<?= htmlspecialchars($ev['id']) ?>">

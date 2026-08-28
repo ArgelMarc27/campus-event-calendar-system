@@ -182,6 +182,8 @@ function supabase_mock_data(string $table): array
         // No rows by default — pages still render fine (just show an empty
         // state) when Supabase is unreachable.
         'event_registrations' => [],
+        'categories' => [],
+        'organizations' => [],
     ];
 
     return $mocks[$table] ?? [];
@@ -531,14 +533,211 @@ function delete_event_admin(string $eventId): array
     return ['ok' => true, 'message' => 'Event deleted.'];
 }
 
-/** Categories for the admin form's dropdown. */
+/**
+ * Change ONLY an event's status (cancel / mark completed / revert to draft /
+ * publish), without touching the rest of its fields. Kept separate from
+ * update_event_admin() so the "Cancel" / "Mark Completed" row-actions in
+ * event-organizer.php don't need to resubmit the whole edit form.
+ *
+ * `status` is a real Postgres enum — only these four values are valid.
+ * `is_published` is kept in sync since the public-facing queries in
+ * supabase_request() filter on `status=eq.published`, not on is_published,
+ * but is_published is still denormalized onto the row for anything else
+ * that reads it directly.
+ *
+ * @return array{ok:bool, message:string}
+ */
+function set_event_status_admin(string $eventId, string $status): array
+{
+    $allowed = ['draft', 'published', 'cancelled', 'completed'];
+    if (!in_array($status, $allowed, true)) {
+        return ['ok' => false, 'message' => 'Invalid status.'];
+    }
+
+    $token = $_SESSION['access_token'] ?? null;
+    $result = supabase_request('events', 'id=eq.' . urlencode($eventId), 'PATCH', [
+        'status' => $status,
+        'is_published' => $status === 'published',
+    ], false, $token);
+
+    if (empty($result)) {
+        return ['ok' => false, 'message' => 'Could not update the event status. Please try again.'];
+    }
+
+    $labels = ['draft' => 'moved back to draft', 'published' => 'published', 'cancelled' => 'cancelled', 'completed' => 'marked completed'];
+    return ['ok' => true, 'message' => 'Event ' . $labels[$status] . '.'];
+}
+
+/** Categories for the admin form's dropdown (name only, alphabetical). */
 function get_categories(): array
 {
     return supabase_request('categories', 'select=id,name&order=name.asc');
 }
 
-/** Organizations for the admin form's dropdown. */
+/** Organizations for the admin form's dropdown (name only, alphabetical). */
 function get_organizations(): array
 {
     return supabase_request('organizations', 'select=id,name&order=name.asc');
+}
+
+// =============================================================================
+// ADMIN — CATEGORIES & ORGANIZATIONS MANAGEMENT (admin-taxonomy.php)
+// =============================================================================
+// Same pattern as event management above: every write runs AS the logged-in
+// admin's own access token so RLS's is_admin() check on `categories` /
+// `organizations` is satisfied. Add these policies once in the Supabase SQL
+// editor if they aren't already there (mirrors the `profiles` ones in
+// AUTH_SETUP.md):
+//
+//   create policy "Admins manage categories"
+//     on categories for all
+//     using (is_admin()) with check (is_admin());
+//
+//   create policy "Categories are viewable by everyone"
+//     on categories for select using (true);
+//
+//   create policy "Admins manage organizations"
+//     on organizations for all
+//     using (is_admin()) with check (is_admin());
+//
+//   create policy "Organizations are viewable by everyone"
+//     on organizations for select using (true);
+//
+// If `is_admin()` isn't already defined as a Postgres function in your
+// project (require_admin() above implies it should exist for the events
+// table's own admin policies), it typically looks like:
+//
+//   create function is_admin() returns boolean as $$
+//     select role = 'admin' from profiles where id = auth.uid();
+//   $$ language sql security definer;
+
+/** All categories, newest first, with a live count of events using each — for the admin table. */
+function get_all_categories_admin(): array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    return supabase_request(
+        'categories',
+        'select=*&order=name.asc',
+        'GET', null, false, $token
+    );
+}
+
+/** Single category by id, for pre-filling the edit form. */
+function get_category_admin(string $categoryId): ?array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    $rows = supabase_request(
+        'categories',
+        'select=*&id=eq.' . urlencode($categoryId) . '&limit=1',
+        'GET', null, false, $token
+    );
+    return $rows[0] ?? null;
+}
+
+/** Create a category. @return array{ok:bool, message:string, id?:string} */
+function create_category_admin(array $fields): array
+{
+    $user = current_user();
+    $token = $_SESSION['access_token'] ?? null;
+    $fields['created_by'] = $user['id'] ?? null;
+
+    $result = supabase_request('categories', '', 'POST', $fields, false, $token);
+    if (empty($result)) {
+        return ['ok' => false, 'message' => 'Could not create the category. The name may already be taken.'];
+    }
+    return ['ok' => true, 'message' => 'Category created.', 'id' => $result[0]['id'] ?? null];
+}
+
+/** Update a category. @return array{ok:bool, message:string} */
+function update_category_admin(string $categoryId, array $fields): array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    $result = supabase_request('categories', 'id=eq.' . urlencode($categoryId), 'PATCH', $fields, false, $token);
+    if (empty($result)) {
+        return ['ok' => false, 'message' => 'Could not save changes. The name may already be taken.'];
+    }
+    return ['ok' => true, 'message' => 'Category updated.'];
+}
+
+/**
+ * Delete a category. NOTE: `events.category_id` has no ON DELETE behavior
+ * documented here — if it's a plain foreign key (no CASCADE/SET NULL),
+ * Postgres will refuse to delete a category that's still referenced by any
+ * event, and this will come back ok:false. That's treated as an expected
+ * validation failure, not a bug: retire the category from event-organizer.php's
+ * dropdown first, or reassign those events, before deleting it.
+ * @return array{ok:bool, message:string}
+ */
+function delete_category_admin(string $categoryId): array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    $result = supabase_request('categories', 'id=eq.' . urlencode($categoryId), 'DELETE', null, false, $token);
+    if (empty($result)) {
+        return ['ok' => false, 'message' => "Could not delete this category — it's probably still used by one or more events."];
+    }
+    return ['ok' => true, 'message' => 'Category deleted.'];
+}
+
+/** All organizations, alphabetical, for the admin table. */
+function get_all_organizations_admin(): array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    return supabase_request(
+        'organizations',
+        'select=*&order=name.asc',
+        'GET', null, false, $token
+    );
+}
+
+/** Single organization by id, for pre-filling the edit form. */
+function get_organization_admin(string $organizationId): ?array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    $rows = supabase_request(
+        'organizations',
+        'select=*&id=eq.' . urlencode($organizationId) . '&limit=1',
+        'GET', null, false, $token
+    );
+    return $rows[0] ?? null;
+}
+
+/** Create an organization. @return array{ok:bool, message:string, id?:string} */
+function create_organization_admin(array $fields): array
+{
+    $user = current_user();
+    $token = $_SESSION['access_token'] ?? null;
+    $fields['created_by'] = $user['id'] ?? null;
+
+    $result = supabase_request('organizations', '', 'POST', $fields, false, $token);
+    if (empty($result)) {
+        return ['ok' => false, 'message' => 'Could not create the organization. The name may already be taken.'];
+    }
+    return ['ok' => true, 'message' => 'Organization created.', 'id' => $result[0]['id'] ?? null];
+}
+
+/** Update an organization. @return array{ok:bool, message:string} */
+function update_organization_admin(string $organizationId, array $fields): array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    $result = supabase_request('organizations', 'id=eq.' . urlencode($organizationId), 'PATCH', $fields, false, $token);
+    if (empty($result)) {
+        return ['ok' => false, 'message' => 'Could not save changes. The name may already be taken.'];
+    }
+    return ['ok' => true, 'message' => 'Organization updated.'];
+}
+
+/**
+ * Delete an organization. Same FK caveat as delete_category_admin() — events
+ * still referencing it via organization_id will block the delete unless the
+ * column has ON DELETE CASCADE/SET NULL.
+ * @return array{ok:bool, message:string}
+ */
+function delete_organization_admin(string $organizationId): array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    $result = supabase_request('organizations', 'id=eq.' . urlencode($organizationId), 'DELETE', null, false, $token);
+    if (empty($result)) {
+        return ['ok' => false, 'message' => "Could not delete this organization — it's probably still used by one or more events."];
+    }
+    return ['ok' => true, 'message' => 'Organization deleted.'];
 }
