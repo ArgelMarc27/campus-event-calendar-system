@@ -46,6 +46,14 @@ function initials(string $name): string {
       <a href="dashboard.php" class="active"><span class="icon">🗂️</span> Dashboard</a>
       <a href="#event"><span class="icon">🎟️</span> Event <span style="margin-left:auto;">⌄</span></a>
     </nav>
+
+    <?php if (($user['role'] ?? 'user') === 'admin'): ?>
+      <div style="margin-top:auto;">
+        <a href="event-organizer.php" style="display:flex; align-items:center; gap:12px; padding:12px 14px; border-radius:8px; font-weight:600; font-size:0.9rem; color:#fff; background:rgba(255,255,255,0.08);">
+          <span class="icon">🛠️</span> Admin View
+        </a>
+      </div>
+    <?php endif; ?>
   </aside>
 
   <!-- Top bar -->

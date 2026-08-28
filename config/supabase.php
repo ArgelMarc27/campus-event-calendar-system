@@ -441,3 +441,104 @@ function require_login(): array
     }
     return $user;
 }
+
+/**
+ * Require an admin session. Non-admins (including logged-out visitors)
+ * get bounced to the dashboard. Relies on `profiles.role` (enum: 'admin' |
+ * 'user') — the same value Supabase's `is_admin()` RLS helper checks, so
+ * what this function allows through and what the database allows through
+ * always agree.
+ */
+function require_admin(): array
+{
+    $user = require_login();
+    if (($user['role'] ?? 'user') !== 'admin') {
+        header('Location: dashboard.php');
+        exit;
+    }
+    return $user;
+}
+
+// =============================================================================
+// ADMIN — EVENT MANAGEMENT (event-organizer.php)
+// =============================================================================
+// All writes run AS the logged-in admin (their own access token), same
+// pattern as everything else in this file. This is what actually lets the
+// write through: Supabase's RLS policies on `events` require is_admin() to
+// be true for insert/update/delete — an admin's own token satisfies that,
+// the anon key alone never will.
+
+/** All events, newest first, for the admin "manage events" table. Every status, not just published. */
+function get_all_events_admin(): array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    return supabase_request(
+        'events',
+        'select=*,categories(name),organizations(name)&order=created_at.desc',
+        'GET', null, false, $token
+    );
+}
+
+/** Single event by id (any status), for pre-filling the edit form. */
+function get_event_admin(string $eventId): ?array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    $rows = supabase_request(
+        'events',
+        'select=*&id=eq.' . urlencode($eventId) . '&limit=1',
+        'GET', null, false, $token
+    );
+    return $rows[0] ?? null;
+}
+
+/**
+ * Create a new event.
+ * @param array $fields Column => value pairs (already validated/typed by the caller).
+ * @return array{ok:bool, message:string, id?:string}
+ */
+function create_event_admin(array $fields): array
+{
+    $user = current_user();
+    $token = $_SESSION['access_token'] ?? null;
+    $fields['created_by'] = $user['id'] ?? null;
+
+    $result = supabase_request('events', '', 'POST', $fields, false, $token);
+    if (empty($result)) {
+        return ['ok' => false, 'message' => 'Could not create the event. Please check the required fields and try again.'];
+    }
+    return ['ok' => true, 'message' => 'Event created.', 'id' => $result[0]['id'] ?? null];
+}
+
+/** Update an existing event. @return array{ok:bool, message:string} */
+function update_event_admin(string $eventId, array $fields): array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    $result = supabase_request('events', 'id=eq.' . urlencode($eventId), 'PATCH', $fields, false, $token);
+    if (empty($result)) {
+        return ['ok' => false, 'message' => 'Could not save changes. Please try again.'];
+    }
+    return ['ok' => true, 'message' => 'Event updated.'];
+}
+
+/** Delete an event. @return array{ok:bool, message:string} */
+function delete_event_admin(string $eventId): array
+{
+    $token = $_SESSION['access_token'] ?? null;
+    $result = supabase_request('events', 'id=eq.' . urlencode($eventId), 'DELETE', null, false, $token);
+    // A successful DELETE with Prefer: return=representation returns the
+    // deleted row(s) — empty here means nothing matched, which we still
+    // treat as success (idempotent), not an error.
+    return ['ok' => true, 'message' => 'Event deleted.'];
+}
+
+/** Categories for the admin form's dropdown. */
+function get_categories(): array
+{
+    return supabase_request('categories', 'select=id,name&order=name.asc');
+}
+
+/** Organizations for the admin form's dropdown. */
+function get_organizations(): array
+{
+    return supabase_request('organizations', 'select=id,name&order=name.asc');
+}
